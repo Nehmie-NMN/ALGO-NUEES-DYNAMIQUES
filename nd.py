@@ -2,9 +2,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
-from sklearn.metrics import silhouette_score
-
-
 # ============================================================
 # 1. CLASSE DES NUÉES DYNAMIQUES
 # ============================================================
@@ -17,7 +14,8 @@ class NueesDynamiques:
         max_iter=100,
         tolerance=1e-4,
         random_state=None,
-        verbose=True
+        verbose=True,
+        representation="points_representatifs"
     ):
 
         if n_clusters < 1:
@@ -40,6 +38,9 @@ class NueesDynamiques:
         self.tolerance = tolerance
         self.random_state = random_state
         self.verbose = verbose
+        self.representation = self._normalize_representation(
+            representation
+        )
 
         # Attributs du modèle
         self.prototypes = None
@@ -48,6 +49,32 @@ class NueesDynamiques:
         self.n_iter_ = 0
         self.inertia_history_ = []
         self.prototype_history_ = []
+        self.n_features_in_ = None
+
+    @staticmethod
+    def _normalize_representation(representation):
+
+        aliases = {
+            "points_representatifs": "points_representatifs",
+            "points représentatifs": "points_representatifs",
+            "axes_factoriels": "axes_factoriels",
+            "axes factoriels": "axes_factoriels",
+            "distribution": "distribution",
+            "structure_representative": "structure_representative",
+            "structure représentative": "structure_representative",
+            "point": "point",
+        }
+
+        key = str(representation).strip().lower()
+
+        if key not in aliases:
+            raise ValueError(
+                "Représentation inconnue. Choisissez parmi : "
+                "points_representatifs, axes_factoriels, distribution, "
+                "structure_representative ou point."
+            )
+
+        return aliases[key]
 
     # ========================================================
     # 2. VALIDATION DES DONNÉES
@@ -158,10 +185,20 @@ class NueesDynamiques:
             # Si le cluster contient des observations
             if len(cluster_points) > 0:
 
-                new_prototypes[k] = np.mean(
-                    cluster_points,
-                    axis=0
-                )
+                if self.representation == "structure_representative":
+                    distances = np.sum(
+                        (cluster_points[:, np.newaxis, :] -
+                         cluster_points[np.newaxis, :, :]) ** 2,
+                        axis=2
+                    )
+                    new_prototypes[k] = cluster_points[
+                        np.argmin(np.sum(distances, axis=1))
+                    ]
+                else:
+                    new_prototypes[k] = np.mean(
+                        cluster_points,
+                        axis=0
+                    )
 
             # Gestion d'un cluster vide
             else:
@@ -204,6 +241,129 @@ class NueesDynamiques:
 
         return inertia
 
+    def _fit_factorial_axes(self, X):
+
+        self.pca_mean_ = np.mean(X, axis=0)
+        centered = X - self.pca_mean_
+        _, singular_values, right_vectors = np.linalg.svd(
+            centered,
+            full_matrices=False
+        )
+        n_components = min(2, X.shape[0], X.shape[1])
+        self.pca_components_ = right_vectors[:n_components]
+        self.pca_values_ = singular_values[:n_components]
+
+        return centered @ self.pca_components_.T
+
+    def _transform_factorial_axes(self, X):
+
+        return (X - self.pca_mean_) @ self.pca_components_.T
+
+    def _fit_distribution(self, X):
+
+        rng = np.random.default_rng(self.random_state)
+        means = X[rng.choice(
+            X.shape[0],
+            size=self.n_clusters,
+            replace=False
+        )].copy()
+        covariances = np.array([
+            np.cov(X, rowvar=False) +
+            np.eye(X.shape[1]) * 1e-6
+            for _ in range(self.n_clusters)
+        ])
+        weights = np.full(self.n_clusters, 1 / self.n_clusters)
+        previous_log_likelihood = -np.inf
+
+        for iteration in range(self.max_iter):
+
+            probabilities = np.zeros((X.shape[0], self.n_clusters))
+
+            for cluster in range(self.n_clusters):
+                covariance = covariances[cluster]
+                inverse = np.linalg.pinv(covariance)
+                determinant = max(np.linalg.det(covariance), 1e-12)
+                differences = X - means[cluster]
+                exponent = -0.5 * np.sum(
+                    (differences @ inverse) * differences,
+                    axis=1
+                )
+                coefficient = 1 / np.sqrt(
+                    (2 * np.pi) ** X.shape[1] * determinant
+                )
+                probabilities[:, cluster] = (
+                    weights[cluster] * coefficient * np.exp(exponent)
+                )
+
+            totals = np.maximum(
+                np.sum(probabilities, axis=1),
+                1e-300
+            )
+            responsibilities = probabilities / totals[:, np.newaxis]
+            log_likelihood = np.sum(np.log(totals))
+
+            effective_sizes = np.sum(responsibilities, axis=0)
+            weights = effective_sizes / X.shape[0]
+
+            for cluster in range(self.n_clusters):
+                if effective_sizes[cluster] < 1e-12:
+                    means[cluster] = X[rng.integers(X.shape[0])]
+                    covariances[cluster] = np.cov(
+                        X,
+                        rowvar=False
+                    ) + np.eye(X.shape[1]) * 1e-6
+                    weights[cluster] = 1 / X.shape[0]
+                    continue
+
+                means[cluster] = np.sum(
+                    responsibilities[:, cluster, np.newaxis] * X,
+                    axis=0
+                ) / effective_sizes[cluster]
+                differences = X - means[cluster]
+                covariances[cluster] = (
+                    (responsibilities[:, cluster, np.newaxis] * differences).T
+                    @ differences / effective_sizes[cluster]
+                    + np.eye(X.shape[1]) * 1e-6
+                )
+
+            if abs(log_likelihood - previous_log_likelihood) < self.tolerance:
+                self.n_iter_ = iteration + 1
+                break
+
+            previous_log_likelihood = log_likelihood
+
+        else:
+            self.n_iter_ = self.max_iter
+
+        self.distribution_means_ = means
+        self.distribution_covariances_ = covariances
+        self.distribution_weights_ = weights
+
+        return self._predict_distribution(X)
+
+    def _predict_distribution(self, X):
+
+        probabilities = np.zeros((X.shape[0], self.n_clusters))
+
+        for cluster in range(self.n_clusters):
+            covariance = self.distribution_covariances_[cluster]
+            inverse = np.linalg.pinv(covariance)
+            determinant = max(np.linalg.det(covariance), 1e-12)
+            differences = X - self.distribution_means_[cluster]
+            exponent = -0.5 * np.sum(
+                (differences @ inverse) * differences,
+                axis=1
+            )
+            coefficient = 1 / np.sqrt(
+                (2 * np.pi) ** X.shape[1] * determinant
+            )
+            probabilities[:, cluster] = (
+                self.distribution_weights_[cluster] *
+                coefficient * np.exp(exponent)
+            )
+
+        return np.argmax(probabilities, axis=1)
+
     # ========================================================
     # 8. ENTRAÎNEMENT DU MODÈLE
     # ========================================================
@@ -211,6 +371,18 @@ class NueesDynamiques:
     def fit(self, X):
 
         X = self._validate_data(X)
+        self.n_features_in_ = X.shape[1]
+
+        if self.representation == "axes_factoriels":
+            X = self._fit_factorial_axes(X)
+
+        if self.representation == "distribution":
+            self.labels = self._fit_distribution(X)
+            self.prototypes = self.distribution_means_.copy()
+            self.inertia_ = self._calculate_inertia(X, self.labels)
+            self.inertia_history_ = [self.inertia_]
+            self.prototype_history = [self.prototypes.copy()]
+            return self
 
         # Initialisation
         self._initialize_prototypes(X)
@@ -310,6 +482,12 @@ class NueesDynamiques:
 
         X = self._validate_data_for_predict(X)
 
+        if self.representation == "axes_factoriels":
+            X = self._transform_factorial_axes(X)
+
+        if self.representation == "distribution":
+            return self._predict_distribution(X)
+
         return self._assign_clusters(X)
 
     # ========================================================
@@ -326,7 +504,7 @@ class NueesDynamiques:
                 "X doit être une matrice 2D."
             )
 
-        if X.shape[1] != self.prototypes.shape[1]:
+        if X.shape[1] != self.n_features_in_:
 
             raise ValueError(
                 "Le nombre de variables de X ne correspond "
@@ -512,9 +690,9 @@ def plot_clusters(X, model):
     plt.show()
 
 
-# ============================================================
+
 # 15. VISUALISATION DE L'ÉVOLUTION DE L'INERTIE
-# ============================================================
+
 
 def plot_inertia_history(model):
 
@@ -548,9 +726,9 @@ def plot_inertia_history(model):
     plt.show()
 
 
-# ============================================================
+
 # 16. VISUALISATION DU DÉPLACEMENT DES PROTOTYPES
-# ============================================================
+
 
 def plot_prototype_evolution(X, model):
 
@@ -611,9 +789,50 @@ def plot_prototype_evolution(X, model):
     plt.show()
 
 
-# ============================================================
+
 # 17. ÉVALUATION AVEC LA SILHOUETTE
-# ============================================================
+
+
+def calculate_silhouette_score(X, labels):
+
+    X = np.asarray(X, dtype=float)
+    labels = np.asarray(labels)
+    distances = np.sqrt(
+        np.sum((X[:, np.newaxis, :] - X[np.newaxis, :, :]) ** 2, axis=2)
+    )
+    scores = np.zeros(X.shape[0])
+
+    for index in range(X.shape[0]):
+        same_cluster = labels == labels[index]
+        same_cluster[index] = False
+
+        if not np.any(same_cluster):
+            continue
+
+        mean_intra_distance = np.mean(distances[index, same_cluster])
+        mean_inter_distances = []
+
+        for other_label in np.unique(labels):
+            if other_label == labels[index]:
+                continue
+
+            other_cluster = labels == other_label
+            mean_inter_distances.append(
+                np.mean(distances[index, other_cluster])
+            )
+
+        nearest_cluster_distance = min(mean_inter_distances)
+        denominator = max(
+            mean_intra_distance,
+            nearest_cluster_distance
+        )
+
+        if denominator > 0:
+            scores[index] = (
+                nearest_cluster_distance - mean_intra_distance
+            ) / denominator
+
+    return float(np.mean(scores))
 
 def evaluate_model(X, model):
 
@@ -632,7 +851,7 @@ def evaluate_model(X, model):
 
         return None
 
-    score = silhouette_score(
+    score = calculate_silhouette_score(
         X,
         labels
     )
@@ -644,9 +863,9 @@ def evaluate_model(X, model):
     return score
 
 
-# ============================================================
+
 # 18. RECHERCHE DU NOMBRE DE CLUSTERS
-# ============================================================
+
 
 def test_different_k(
     X,
@@ -677,7 +896,7 @@ def test_different_k(
             model.inertia_
         )
 
-        score = silhouette_score(
+        score = calculate_silhouette_score(
             X,
             model.labels
         )
@@ -751,9 +970,33 @@ def test_different_k(
     return inertias, silhouette_scores
 
 
-# ============================================================
+
 # 19. PROGRAMME PRINCIPAL
-# ============================================================
+
+
+def choose_representation():
+
+    choices = {
+        "1": "points_representatifs",
+        "2": "axes_factoriels",
+        "3": "distribution",
+        "4": "structure_representative",
+        "5": "point",
+    }
+
+    print("\nChoisissez la représentation de la nuée dynamique :")
+    print("1. Ensemble des points représentatifs")
+    print("2. Axes factoriels")
+    print("3. Distribution")
+    print("4. Structure représentative")
+    print("5. Point (K-means)")
+
+    choice = input("Votre choix [1-5] : ").strip()
+
+    if choice not in choices:
+        raise ValueError("Le choix doit être compris entre 1 et 5.")
+
+    return choices[choice]
 
 if __name__ == "__main__":
 
@@ -772,13 +1015,16 @@ if __name__ == "__main__":
         X
     )
 
+    representation = choose_representation()
+
     # Création du modèle
     model = NueesDynamiques(
         n_clusters=3,
         max_iter=100,
         tolerance=1e-4,
         random_state=42,
-        verbose=True
+        verbose=True,
+        representation=representation
     )
 
     # Entraînement
